@@ -796,9 +796,20 @@ fn block_origin(m: [f32; 6], center: (bool, bool), paper: (f32, f32), size: (f32
     vec2(x, y)
 }
 
-/// Rounds inches to what the margin fields show: whole millimetres or hundredths of an inch.
+/// Rounds inches to what the margin fields show: hundredths of a centimetre or of an inch.
 fn round_margin(inches: f32, metric: bool) -> f32 {
-    if metric { (inches * 25.4).round() / 25.4 } else { (inches * 100.0).round() / 100.0 }
+    if metric { (inches * 254.0).round() / 254.0 } else { (inches * 100.0).round() / 100.0 }
+}
+
+/// The margins to save: those still equal to `kept` (the saved margins, or Normal on a reset)
+/// stay exactly as they are, so a drag or one field edit never rewrites the others; changed ones
+/// are rounded to what the fields show.
+fn margins_to_save(kept: [f32; 6], margins: [f32; 6], metric: bool) -> [f32; 6] {
+    let mut out = margins;
+    for (v, k) in out.iter_mut().zip(kept) {
+        *v = if (*v - k).abs() < 1e-4 { k } else { round_margin(*v, metric) };
+    }
+    out
 }
 
 /// The page's margins (inches) from the preview, hostile values replaced by Normal.
@@ -817,11 +828,12 @@ fn num(v: Option<&Json>, key: &str) -> Option<f32> {
     v.and_then(|v| v.get(key)).and_then(Json::as_f64).filter(|v| v.is_finite()).map(|v| v as f32)
 }
 
-/// Saves margins and centring for `sheet` as one undo step.
-fn commit_margins(app: &mut SheetApp, sheet: &str, margins: [f32; 6], center: (bool, bool), metric: bool) {
+/// Saves margins and centring for `sheet` as one undo step; margins equal to `kept` are saved as
+/// they are (see [`margins_to_save`]).
+fn commit_margins(app: &mut SheetApp, sheet: &str, kept: [f32; 6], margins: [f32; 6], center: (bool, bool), metric: bool) {
     let mut m = serde_json::Map::new();
-    for (key, v) in MARGIN_KEYS.iter().zip(margins) {
-        m.insert((*key).to_string(), json!(round_margin(v, metric)));
+    for (key, v) in MARGIN_KEYS.iter().zip(margins_to_save(kept, margins, metric)) {
+        m.insert((*key).to_string(), json!(v));
     }
     app.run_or_alert("pageLayout.pageSetup", json!({"sheet": sheet, "margins": m, "centerH": center.0, "centerV": center.1}));
 }
@@ -948,6 +960,7 @@ fn margin_fields(app: &mut SheetApp, ui: &mut Ui, bs: &mut Backstage, sheet: &st
     let (margins, center) = bs.margin_draft.as_ref().map_or((saved, saved_center), |d| (d.margins, d.center));
     let (factor, unit, step) = if metric { (2.54, " cm", 0.01) } else { (1.0, " in", 0.005) };
     let mut commit: Option<([f32; 6], (bool, bool))> = None;
+    let mut kept = saved;
     egui::Grid::new("backstage_print_margins").num_columns(4).spacing([8.0, 4.0]).show(ui, |ui| {
         for (pair, labels) in [[0usize, 1], [2, 3], [4, 5]].iter().zip([["Left", "Right"], ["Top", "Bottom"], ["Header", "Footer"]]) {
             for (&i, label) in pair.iter().zip(labels) {
@@ -1008,6 +1021,7 @@ fn margin_fields(app: &mut SheetApp, ui: &mut Ui, bs: &mut Backstage, sheet: &st
     ui.horizontal(|ui| {
         if ui.link(lang.tr("Normal margins")).on_hover_text(lang.tr("Margins back to Normal and the table back to the top left.")).clicked() {
             commit = Some((NORMAL_MARGINS, (false, false)));
+            kept = NORMAL_MARGINS;
         }
         ui.add_space(12.0);
         let mut m = metric;
@@ -1017,7 +1031,7 @@ fn margin_fields(app: &mut SheetApp, ui: &mut Ui, bs: &mut Backstage, sheet: &st
     });
     if let Some((m, c)) = commit {
         bs.margin_draft = None;
-        commit_margins(app, sheet, m, c, metric);
+        commit_margins(app, sheet, kept, m, c, metric);
     }
 }
 
@@ -1113,7 +1127,7 @@ fn preview_page(
         && let Some(d) = bs.margin_draft.take_if(|d| d.target.is_some())
     {
         if d.margins != d.start || d.center != d.start_center {
-            commit_margins(app, sheet, d.margins, d.center, metric);
+            commit_margins(app, sheet, d.start, d.margins, d.center, metric);
         }
         return;
     }
@@ -1433,7 +1447,17 @@ mod tests {
         // Centring puts the block in the middle of the printable area.
         let at = block_origin(NORMAL_MARGINS, (true, false), letter, (144.0, 60.0));
         assert!((at.x - (50.4 + (612.0 - 100.8 - 144.0) / 2.0)).abs() < 1e-3 && (at.y - 54.0).abs() < 1e-3);
-        assert!((round_margin(0.7, true) * 25.4 - 18.0).abs() < 1e-3);
+        // Metric rounds to hundredths of a centimetre, as the fields show.
+        assert!((round_margin(0.5, true) * 2.54 - 1.27).abs() < 1e-4);
+        assert!((round_margin(0.7, true) * 2.54 - 1.78).abs() < 1e-4);
+        // Only changed margins are rounded: a one-field edit leaves Normal's exact inches alone.
+        let mut edited = NORMAL_MARGINS;
+        edited[0] = 1.27 / 2.54 + 0.0001;
+        let saved = margins_to_save(NORMAL_MARGINS, edited, true);
+        assert_eq!(saved[1..], NORMAL_MARGINS[1..]);
+        assert!((saved[0] * 2.54 - 1.27).abs() < 1e-4);
+        // A reset to Normal saves Normal exactly.
+        assert_eq!(margins_to_save(NORMAL_MARGINS, NORMAL_MARGINS, true), NORMAL_MARGINS);
     }
 
     #[test]
